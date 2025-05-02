@@ -1,0 +1,6 @@
+ftfy
+accelerate>=1.6.0
+einops
+diffusers>=0.33.1
+sentencepiece>=0.2.0
+protobuf
