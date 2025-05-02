@@ -6,14 +6,12 @@ import os
 from typing import List, Dict, Any
 from server import PromptServer
 from aiohttp import web
-from urllib.parse import quote_plus
 import base64
-import time
 
 # Load environment variables
-BACKBLAZE_BASE_URL = os.environ.get("BACKBLAZE_BASE_URL")
 BACKBLAZE_KEY_ID = os.environ.get("BACKBLAZE_KEY_ID")
 BACKBLAZE_APPLICATION_KEY = os.environ.get("BACKBLAZE_APPLICATION_KEY")
+BACKBLAZE_BUCKET_NAME = os.environ.get("BACKBLAZE_BUCKET_NAME")
 
 class WanVideoLoraTagLoader:
     def __init__(self):
@@ -82,27 +80,53 @@ class WanVideoLoraTagLoader:
 
     def download_lora_from_backblaze(self, model_id: str, save_path: Path) -> bool:
         try:
-            if not BACKBLAZE_KEY_ID or not BACKBLAZE_APPLICATION_KEY:
-                raise RuntimeError("Missing Backblaze credentials (BACKBLAZE_KEY_ID and BACKBLAZE_APPLICATION_KEY must be set)")
+            if not BACKBLAZE_KEY_ID or not BACKBLAZE_APPLICATION_KEY or not BACKBLAZE_BUCKET_NAME:
+                raise RuntimeError("Missing Backblaze credentials or bucket name")
 
-            # Build authorization header
+            # Step 1: Authorize account
             auth_str = f"{BACKBLAZE_KEY_ID}:{BACKBLAZE_APPLICATION_KEY}"
-            b64_auth = base64.b64encode(auth_str.encode()).decode()
+            auth_encoded = base64.b64encode(auth_str.encode()).decode()
+            headers = {"Authorization": f"Basic {auth_encoded}"}
 
-            headers = {
-                "Authorization": f"Basic {b64_auth}"
+            auth_response = requests.get("https://api.backblazeb2.com/b2api/v3/b2_authorize_account", headers=headers)
+            auth_response.raise_for_status()
+            auth_data = auth_response.json()
+
+            api_url = auth_data['apiInfo']['storageApi']['apiUrl']
+            download_url = auth_data['apiInfo']['storageApi']['downloadUrl']
+            account_auth_token = auth_data['authorizationToken']
+            account_id = auth_data['accountId']
+
+            # Step 2: Get bucket ID
+            buckets_url = f"{api_url}/b2api/v3/b2_list_buckets"
+            buckets_payload = {"accountId": account_id, "bucketName": BACKBLAZE_BUCKET_NAME}
+            buckets_headers = {"Authorization": account_auth_token}
+
+            buckets_resp = requests.post(buckets_url, json=buckets_payload, headers=buckets_headers)
+            buckets_resp.raise_for_status()
+            bucket_id = buckets_resp.json()['buckets'][0]['bucketId']
+
+            # Step 3: Get download authorization
+            authz_url = f"{api_url}/b2api/v3/b2_get_download_authorization"
+            authz_payload = {
+                "bucketId": bucket_id,
+                "fileNamePrefix": f"{model_id}.safetensors",
+                "validDurationInSeconds": 3600
             }
+            authz_resp = requests.post(authz_url, json=authz_payload, headers=buckets_headers)
+            authz_resp.raise_for_status()
+            download_auth_token = authz_resp.json()['authorizationToken']
 
-            url = f"{BACKBLAZE_BASE_URL}/{model_id}.safetensors"
-            with requests.get(url, stream=True, headers=headers) as resp:
-                if resp.status_code != 200:
-                    print(f"[WanVideoLoraTagLoader] HTTP {resp.status_code} for {url}")
-                    return False
+            # Step 4: Download file with token
+            file_url = f"{download_url}/file/{BACKBLAZE_BUCKET_NAME}/{model_id}.safetensors?Authorization={download_auth_token}"
+            with requests.get(file_url, stream=True) as resp:
+                resp.raise_for_status()
                 with open(save_path, 'wb') as f:
                     for chunk in resp.iter_content(chunk_size=8192):
                         f.write(chunk)
             print(f"[WanVideoLoraTagLoader] Downloaded {model_id}.safetensors to {save_path}")
             return True
+
         except Exception as e:
             print(f"[WanVideoLoraTagLoader] Exception downloading {model_id}: {e}")
             return False
